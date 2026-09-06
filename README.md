@@ -51,13 +51,19 @@ error — it will never silently fall back to fake data.
 Input: `{ poolId: "0x...", swapLimit?: number }` (default 50, max 500)
 
 Pulls the most recent N swaps for a Uniswap V3 pool and computes:
-- `swapCount` — how many swaps in the window
-- `netDirectionalFlow` — signed sum of swap amounts (which way the pool is being pushed)
-- `largestSwapFraction` — the single biggest swap as a fraction of total window volume
-  (a simple concentration/whale-risk signal)
+- `swapCount`, `totalVolumeUSD`, `largestSingleSwapUSD`
+- `concentrationRatio` — largest single swap as a fraction of total window volume, plus a
+  `concentrationFlag` ("HIGH" above 0.3 — possible whale/manipulation signal, else "normal")
+- `directionalBiasPct` — what fraction of swaps pushed the pool the same direction
 
 This is meant as a building block: an agent asking "is this pool being manipulated right
 now?" gets a computed answer, not a page of raw swap rows to parse itself.
+
+### `graph_factory_health`
+
+No input required. Returns live protocol-wide Uniswap V3 stats (`poolCount`, `txCount`,
+`totalVolumeUSD`, `totalValueLockedUSD`) — useful as a cheap sanity check that the data
+source is live and current before trusting a pool-level result.
 
 ## Spec / AI-use disclosure
 

@@ -26,8 +26,11 @@ Run the MCP server: `npm start` from the repo root, then connect it as an MCP to
 
 ## Tools
 
-- `graph_pool_risk_snapshot(poolId, swapLimit?)` → `{ swapCount, netDirectionalFlow,
-  largestSwapFraction }` for a Uniswap V3 pool's recent swap window.
+- `graph_pool_risk_snapshot(poolId, swapLimit?)` → `{ swapCount, totalVolumeUSD,
+  largestSingleSwapUSD, concentrationRatio, concentrationFlag, directionalBiasPct }` for a
+  Uniswap V3 pool's recent swap window.
+- `graph_factory_health()` → `{ poolCount, txCount, totalVolumeUSD, totalValueLockedUSD }` —
+  protocol-wide live sanity check, no input needed.
 
 ## What this does NOT do
 
