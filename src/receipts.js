@@ -32,6 +32,36 @@ export function hashResult(data) {
   return "sha256:" + createHash("sha256").update(canonical(data)).digest("hex");
 }
 
+// Named evaluators. A receipt that only hashes the data proves the DATA was not
+// swapped; it says nothing about the verdict written next to it. Recording which
+// evaluator (and which params) produced the verdict lets a replay recompute the
+// claim, verdict, reason and observed values from the data and catch an edit.
+const EVALUATORS = new Map();
+
+/**
+ * Register an evaluator: { claim(params, variables) -> string,
+ *                          evaluate(data, params) -> { verdict, reason, observed } }.
+ * Both must be pure functions of their arguments, or replay cannot reproduce them.
+ */
+export function registerEvaluator(id, impl) {
+  if (typeof impl?.evaluate !== "function" || typeof impl?.claim !== "function") {
+    throw new Error(`evaluator ${id} needs claim() and evaluate()`);
+  }
+  EVALUATORS.set(id, impl);
+}
+
+function runEvaluator(evaluator, data, variables) {
+  const impl = EVALUATORS.get(evaluator.id);
+  const params = evaluator.params ?? {};
+  const out = impl.evaluate(data, params) ?? {};
+  return {
+    claim: impl.claim(params, variables ?? {}),
+    verdict: out.verdict ?? "indeterminate",
+    reason: out.reason ?? "",
+    observed: out.observed ?? null,
+  };
+}
+
 /**
  * Run a query AND capture the block height it was answered at, in one round trip.
  * `_meta` is a standard subgraph field — asking for it alongside the real query
@@ -53,12 +83,25 @@ export async function queryWithBlock(subgraphId, query, variables = {}) {
 /**
  * Issue a receipt for a claim.
  *
- * The verdict is computed by `evaluate(data)` -> { verdict, reason, observed }.
+ * Pass `evaluator: { id, params }` naming a registered evaluator: the claim text
+ * and verdict are then derived from it and can be recomputed on replay. A bare
+ * `evaluate(data)` function still works, but the receipt carries a caveat that
+ * its verdict is not bound to the evidence.
  * Note the asymmetry: we record `unsupported` and `indeterminate` just as
  * permanently as `supported`. A receipts system that only keeps its wins is a
  * highlight reel, and the whole point here is that it isn't one.
  */
-export async function issueReceipt({ claim, subgraphId, query, variables = {}, evaluate }) {
+export async function issueReceipt({
+  claim,
+  subgraphId,
+  query,
+  variables = {},
+  evaluate,
+  evaluator,
+}) {
+  if (evaluator && !EVALUATORS.has(evaluator.id)) {
+    throw new Error(`unknown evaluator: ${evaluator.id}`);
+  }
   const issuedAt = new Date().toISOString();
   const { data, meta } = await queryWithBlock(subgraphId, query, variables);
   const resultHash = hashResult(data);
@@ -66,7 +109,9 @@ export async function issueReceipt({ claim, subgraphId, query, variables = {}, e
   let verdict = "indeterminate";
   let reason = "no evaluator supplied";
   let observed = null;
-  if (typeof evaluate === "function") {
+  if (evaluator) {
+    ({ claim, verdict, reason, observed } = runEvaluator(evaluator, data, variables));
+  } else if (typeof evaluate === "function") {
     const out = evaluate(data) ?? {};
     verdict = out.verdict ?? "indeterminate";
     reason = out.reason ?? "";
@@ -80,7 +125,12 @@ export async function issueReceipt({ claim, subgraphId, query, variables = {}, e
     caveats.push("subgraph reported indexing errors at query time");
   }
   if (!meta?.block?.number) {
-    caveats.push("no block height returned; replay cannot be pinned to a block");
+    caveats.push("no block height returned; the receipt cannot say when on-chain it was true");
+  }
+  if (!evaluator) {
+    caveats.push(
+      "no registered evaluator; replay checks the data hash only and cannot recompute the verdict"
+    );
   }
 
   return {
@@ -89,6 +139,7 @@ export async function issueReceipt({ claim, subgraphId, query, variables = {}, e
     verdict,
     reason,
     observed,
+    evaluator: evaluator ? { id: evaluator.id, params: evaluator.params ?? {} } : null,
     evidence: {
       subgraphId,
       query,
@@ -106,8 +157,15 @@ export async function issueReceipt({ claim, subgraphId, query, variables = {}, e
 /**
  * Replay a receipt against live data.
  *
- * Three outcomes, and the middle one is the interesting one:
- *   verified   — same query, same hash. The claim's evidence is intact.
+ * The replay runs the stored query against the CURRENT chain head; it is not
+ * pinned to `evidence.block`. A windowed query ("most recent N swaps") therefore
+ * drifts as soon as the window moves, and a drifted receipt cannot be re-checked.
+ *
+ * Outcomes:
+ *   verified   — same query, same hash, and (when the receipt names a registered
+ *                evaluator) the recomputed claim/verdict/reason/observed match.
+ *   tampered   — the data hash matches but the claim, verdict, reason or
+ *                observed values are not what the evaluator produces from it.
  *   drifted    — query still works, but the data changed (new swaps, reorg,
  *                re-index). NOT fraud: expected for time-windowed queries.
  *                Reported honestly instead of being called a failure.
@@ -128,9 +186,38 @@ export async function verifyReceipt(receipt) {
   const nowBlock = now.meta?.block?.number ? Number(now.meta.block.number) : null;
 
   if (nowHash === resultHash) {
+    const ev = receipt.evaluator;
+    let verdictChecked = false;
+    if (ev?.id) {
+      if (!EVALUATORS.has(ev.id)) {
+        return { status: "broken", detail: `receipt names unknown evaluator: ${ev.id}` };
+      }
+      const expected = runEvaluator(ev, now.data, variables);
+      const mismatched = ["claim", "verdict", "reason", "observed"].filter(
+        (k) => canonical(expected[k]) !== canonical(receipt[k] ?? null)
+      );
+      if (mismatched.length) {
+        return {
+          status: "tampered",
+          detail:
+            "data hash matches, but the receipt does not say what the evaluator computes " +
+            `from that data. Mismatched fields: ${mismatched.join(", ")}`,
+          mismatched,
+          expected,
+          originalBlock: block ?? null,
+          replayBlock: nowBlock,
+          resultHash,
+        };
+      }
+      verdictChecked = true;
+    }
     return {
       status: "verified",
-      detail: "replayed query returned byte-identical data",
+      detail: verdictChecked
+        ? "replayed query returned byte-identical data and the verdict recomputes from it"
+        : "replayed query returned byte-identical data; the verdict was NOT recomputed " +
+          "(receipt names no registered evaluator)",
+      verdictChecked,
       originalBlock: block ?? null,
       replayBlock: nowBlock,
       resultHash,

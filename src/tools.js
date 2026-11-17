@@ -4,7 +4,7 @@
 // doing "meaningful work with the data: reasoning, decisions, automation."
 
 import { queryGraphSubgraph } from "./graph-client.js";
-import { issueReceipt, verifyReceipt } from "./receipts.js";
+import { issueReceipt, verifyReceipt, registerEvaluator } from "./receipts.js";
 
 // Well-known public subgraph deployment IDs (mainnet). Kept as named constants so the
 // agent-facing tool surface stays in human terms ("uniswap-v3") rather than raw IDs.
@@ -17,7 +17,8 @@ export const TOOLS = [
     name: "graph_pool_risk_snapshot",
     description:
       "Pull a live Uniswap V3 pool's recent swap activity and compute a simple concentration/" +
-      "volatility risk read: swap count, net directional flow, and largest single swap as a " +
+      "volatility risk read: swap count, net directional flow (signed sum of token0 amounts), " +
+      "share of swaps on the dominant side, and largest single swap as a " +
       "fraction of total volume in the window. Real reasoning over live indexed data, not a " +
       "raw query dump.",
     inputSchema: {
@@ -66,8 +67,9 @@ export const TOOLS = [
   {
     name: "graph_verify_receipt",
     description:
-      "Replay a previously-issued receipt against live Graph data. Returns verified (same " +
-      "data hash), drifted (query still resolves but data moved -- expected for time-windowed " +
+      "Replay a previously-issued receipt against live Graph data (current head, not the " +
+      "recorded block). Returns verified (same data hash and the verdict recomputes from " +
+      "it), tampered (data matches but claim/verdict/observed were edited), drifted (query still resolves but data moved -- expected for time-windowed " +
       "claims, reported honestly rather than as failure), or broken (query no longer runs). " +
       "This is what makes a claim trustworthy to someone who does not trust the agent.",
     inputSchema: {
@@ -130,10 +132,11 @@ async function poolRiskSnapshot({ poolId, swapLimit }) {
   }
 
   const concentrationRatio = totalVolumeUSD > 0 ? largestAbsUSD / totalVolumeUSD : 0;
-  const directionalBiasPct =
-    swaps.length > 0
-      ? (swaps.filter((s) => Number(s.amount0) > 0).length / swaps.length) * 100
-      : 0;
+  // Share of swaps on the dominant side: 50 = balanced, 100 = all one way.
+  // (Counting only amount0 > 0 would report 90% one-way selling as 10.)
+  const positive = swaps.filter((s) => Number(s.amount0) > 0).length;
+  const negative = swaps.filter((s) => Number(s.amount0) < 0).length;
+  const directionalBiasPct = (Math.max(positive, negative) / swaps.length) * 100;
 
   return {
     poolId,
@@ -149,6 +152,11 @@ async function poolRiskSnapshot({ poolId, swapLimit }) {
         ? "HIGH — one swap dominates recent volume, possible whale/manipulation signal"
         : "normal",
     directionalBiasPct: Number(directionalBiasPct.toFixed(1)),
+    dominantDirection:
+      positive === negative ? "balanced" : positive > negative ? "token0-in" : "token0-out",
+    // Signed sum of amount0 over the window, in token0 units. Positive = the
+    // pool took in token0 on net.
+    netAmount0: netAmount0,
     windowNote: `most recent ${swaps.length} swaps as of query time (live)`,
   };
 }
@@ -192,49 +200,55 @@ async function claimPoolConcentration({ poolId, threshold, swapLimit }) {
     }`;
 
   return issueReceipt({
-    claim:
-      `In the most recent ${limit} swaps, a single swap accounts for more than ` +
-      `${(cut * 100).toFixed(0)}% of total volume in Uniswap V3 pool ${pool}.`,
     subgraphId: SUBGRAPHS["uniswap-v3"],
     query,
     variables: { pool, limit },
-    evaluate: (data) => {
-      const swaps = data?.swaps ?? [];
-      if (swaps.length === 0) {
-        return {
-          verdict: "indeterminate",
-          reason: "no swaps returned for this pool in the queried window",
-          observed: { swapCount: 0 },
-        };
-      }
-      let total = 0;
-      let largest = 0;
-      for (const s of swaps) {
-        const usd = Math.abs(Number(s.amountUSD));
-        total += usd;
-        if (usd > largest) largest = usd;
-      }
-      const ratio = total > 0 ? largest / total : 0;
-      const pair = data?.pool
-        ? `${data.pool.token0.symbol}/${data.pool.token1.symbol}`
-        : "unknown";
-      return {
-        verdict: ratio > cut ? "supported" : "unsupported",
-        reason:
-          `largest single swap was $${largest.toFixed(2)} of $${total.toFixed(2)} total ` +
-          `(${(ratio * 100).toFixed(2)}%), threshold ${(cut * 100).toFixed(0)}%`,
-        observed: {
-          pair,
-          swapCount: swaps.length,
-          totalVolumeUSD: Number(total.toFixed(2)),
-          largestSingleSwapUSD: Number(largest.toFixed(2)),
-          concentrationRatio: Number(ratio.toFixed(4)),
-          threshold: cut,
-        },
-      };
-    },
+    evaluator: { id: "pool_concentration", params: { threshold: cut } },
   });
 }
+
+// Registered by name so graph_verify_receipt can recompute the claim and the
+// verdict from replayed data instead of trusting what the receipt says.
+registerEvaluator("pool_concentration", {
+  claim: ({ threshold }, { pool, limit }) =>
+    `In the most recent ${limit} swaps, a single swap accounts for more than ` +
+    `${(threshold * 100).toFixed(0)}% of total volume in Uniswap V3 pool ${pool}.`,
+  evaluate: (data, { threshold: cut }) => {
+    const swaps = data?.swaps ?? [];
+    if (swaps.length === 0) {
+      return {
+        verdict: "indeterminate",
+        reason: "no swaps returned for this pool in the queried window",
+        observed: { swapCount: 0 },
+      };
+    }
+    let total = 0;
+    let largest = 0;
+    for (const s of swaps) {
+      const usd = Math.abs(Number(s.amountUSD));
+      total += usd;
+      if (usd > largest) largest = usd;
+    }
+    const ratio = total > 0 ? largest / total : 0;
+    const pair = data?.pool
+      ? `${data.pool.token0.symbol}/${data.pool.token1.symbol}`
+      : "unknown";
+    return {
+      verdict: ratio > cut ? "supported" : "unsupported",
+      reason:
+        `largest single swap was $${largest.toFixed(2)} of $${total.toFixed(2)} total ` +
+        `(${(ratio * 100).toFixed(2)}%), threshold ${(cut * 100).toFixed(0)}%`,
+      observed: {
+        pair,
+        swapCount: swaps.length,
+        totalVolumeUSD: Number(total.toFixed(2)),
+        largestSingleSwapUSD: Number(largest.toFixed(2)),
+        concentrationRatio: Number(ratio.toFixed(4)),
+        threshold: cut,
+      },
+    };
+  },
+});
 
 export async function runTool(name, args) {
   switch (name) {

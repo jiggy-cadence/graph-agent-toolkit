@@ -2,11 +2,11 @@
 //   1. issue a receipt for a claim that should be UNSUPPORTED (quiet blue-chip pool)
 //   2. replay it immediately -> verified or drifted, both honest outcomes
 //   3. tamper with the receipt -> replay must NOT say "verified"
+//   4. edit the verdict but keep the hash -> replay must NOT say "verified"
 //
-// Step 3 is the one that matters. A verifier that says "verified" for everything
+// Steps 3 and 4 are the ones that matter. A verifier that says "verified" for everything
 // is decoration. This proves it can actually fail.
 
-import { issueReceipt, verifyReceipt, hashResult } from "../src/receipts.js";
 import { runTool } from "../src/tools.js";
 
 const USDC_WETH = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640";
@@ -29,11 +29,17 @@ forged.evidence.resultHash = "sha256:" + "0".repeat(64);
 const tampered = await runTool("graph_verify_receipt", { receipt: forged });
 console.log(JSON.stringify(tampered, null, 2));
 
-const ok = tampered.status !== "verified";
+console.log("\n4) NEGATIVE CONTROL — flipping the verdict, leaving the hash alone...\n");
+const flipped = JSON.parse(JSON.stringify(receipt));
+flipped.verdict = receipt.verdict === "supported" ? "unsupported" : "supported";
+const flippedReplay = await runTool("graph_verify_receipt", { receipt: flipped });
+console.log(JSON.stringify(flippedReplay, null, 2));
+
+const ok = tampered.status !== "verified" && flippedReplay.status !== "verified";
 console.log(
   "\n" +
     (ok
-      ? "PASS — a forged hash does NOT verify. The check can fail, so passing means something."
+      ? "PASS — neither a forged hash nor an edited verdict verifies. The check can fail, so passing means something."
       : "FAIL — forged receipt verified. The verifier is decoration; do not ship.")
 );
 process.exit(ok ? 0 : 1);
