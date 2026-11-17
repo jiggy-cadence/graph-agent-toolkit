@@ -13,7 +13,7 @@ and get back a computed signal, not a page of raw rows.
 - The agent is reasoning about on-chain risk, liquidity, or trading activity and needs a
   live data point to reason over (not a static/cached figure).
 - The agent needs to distinguish "quiet pool" from "one whale just moved the market" —
-  that's what `largestSwapFraction` is for.
+  that's what `concentrationRatio` is for.
 
 ## Setup
 
@@ -27,10 +27,14 @@ Run the MCP server: `npm start` from the repo root, then connect it as an MCP to
 ## Tools
 
 - `graph_pool_risk_snapshot(poolId, swapLimit?)` → `{ swapCount, totalVolumeUSD,
-  largestSingleSwapUSD, concentrationRatio, concentrationFlag, directionalBiasPct }` for a
-  Uniswap V3 pool's recent swap window.
+  largestSingleSwapUSD, concentrationRatio, concentrationFlag, directionalBiasPct, dominantDirection,
+  netAmount0 }` for a Uniswap V3 pool's recent swap window.
 - `graph_factory_health()` → `{ poolCount, txCount, totalVolumeUSD, totalValueLockedUSD }` —
   protocol-wide live sanity check, no input needed.
+- `graph_claim_pool_concentration(poolId, threshold?, swapLimit?)` → a receipt:
+  `{ claim, verdict, reason, observed, evaluator, evidence, caveats, issuedAt }`.
+- `graph_verify_receipt(receipt)` → `{ status }`, one of `verified`, `tampered`, `drifted`,
+  `broken`. Replays against the current head, so receipts over a moving window drift.
 
 ## What this does NOT do
 

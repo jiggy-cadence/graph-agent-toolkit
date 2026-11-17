@@ -13,7 +13,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { queryGraphSubgraph, canaryQuery } from "./graph-client.js";
+import { canaryQuery } from "./graph-client.js";
 import { TOOLS, runTool } from "./tools.js";
 
 const server = new Server(
@@ -45,15 +45,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 async function main() {
   // Fail loud at boot if we're not actually wired to live data — never let this server
   // silently serve mocked results (the ETHOnline live-data gate is pass/fail).
-  if (process.env.SKIP_BOOT_CANARY !== "1") {
-    try {
-      await canaryQuery();
-      console.error("[graph-agent-toolkit] boot canary OK — Gateway key is live.");
-    } catch (err) {
-      console.error("[graph-agent-toolkit] BOOT CANARY FAILED:", err.message);
-      console.error("[graph-agent-toolkit] refusing to start against unproven data access.");
-      process.exit(1);
-    }
+  // There is deliberately no environment switch to skip this.
+  try {
+    const c = await canaryQuery();
+    console.error(
+      `[graph-agent-toolkit] boot canary OK — Gateway key is live, head ${c.lagSeconds}s behind.`
+    );
+  } catch (err) {
+    console.error("[graph-agent-toolkit] BOOT CANARY FAILED:", err.message);
+    console.error("[graph-agent-toolkit] refusing to start against unproven data access.");
+    process.exit(1);
   }
 
   const transport = new StdioServerTransport();

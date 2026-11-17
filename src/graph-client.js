@@ -40,16 +40,21 @@ export async function queryGraphSubgraph(subgraphId, query, variables = {}) {
   return json.data;
 }
 
+// The canary rejects a subgraph whose latest indexed block is older than this.
+// Mainnet produces a block every ~12s; an hour behind means the indexer is stuck.
+export const CANARY_MAX_LAG_SECONDS = 3600;
+
 /**
  * Canary: prove the key is live against a known-present, well-indexed subgraph
- * (Uniswap V3 mainnet) before trusting any other result from this client.
+ * (Uniswap V3 mainnet) AND that the subgraph head is recent, before trusting any
+ * other result from this client.
  */
-export async function canaryQuery() {
+export async function canaryQuery(nowMs = Date.now()) {
   // Uniswap V3 mainnet subgraph deployment ID (public, well-known).
   const UNISWAP_V3_MAINNET = "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV";
   const data = await queryGraphSubgraph(
     UNISWAP_V3_MAINNET,
-    `{ factories(first: 1) { id poolCount txCount } }`
+    `{ factories(first: 1) { id poolCount txCount } _meta { block { number timestamp } } }`
   );
   const factory = data?.factories?.[0];
   if (!factory || Number(factory.poolCount) <= 0) {
@@ -58,5 +63,16 @@ export async function canaryQuery() {
         JSON.stringify(data)
     );
   }
-  return factory;
+  const headTs = Number(data?._meta?.block?.timestamp);
+  if (!Number.isFinite(headTs) || headTs <= 0) {
+    throw new Error("CANARY FAILED: subgraph returned no head block timestamp; freshness unproven");
+  }
+  const lagSeconds = Math.floor(nowMs / 1000) - headTs;
+  if (lagSeconds > CANARY_MAX_LAG_SECONDS) {
+    throw new Error(
+      `CANARY FAILED: subgraph head is ${lagSeconds}s behind wall clock ` +
+        `(limit ${CANARY_MAX_LAG_SECONDS}s) -- data is stale`
+    );
+  }
+  return { ...factory, headBlock: Number(data._meta.block.number), lagSeconds };
 }
